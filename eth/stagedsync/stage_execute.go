@@ -187,6 +187,65 @@ func newStateReaderWriter(
 	return stateReader, stateWriter, nil
 }
 
+func fetchBlocks(ctx context.Context, cfg ExecuteBlockCfg, blockChan chan *types.Block, errChan chan error, quitChan chan int, from uint64, to uint64) {
+	var err error
+
+	rodb, err := cfg.db.BeginRo(ctx)
+	if err == nil {
+		defer rodb.Rollback()
+
+		Loop: for blockNum := from; blockNum <= to; blockNum++ {
+
+			blockHash, err := rawdb.ReadCanonicalHash(rodb, blockNum)
+			if err != nil {
+				break
+			}
+			block, _, err := cfg.blockReader.BlockWithSenders(ctx, rodb, blockHash, blockNum)
+			if err != nil {
+				break
+			}
+
+			if block != nil {
+				for _, tx := range block.Transactions() {
+
+					// prefetch 'from' account
+					// The tx was provided by BlockWithSenders() which saves the sender to the transaction,
+					// meaning we can use .GetSender() directly and we don't need to derive it by .Sender(Signer).
+					from_addr, _ := tx.GetSender()
+					rodb.GetOne(kv.PlainState, from_addr.Bytes())
+
+					// prefetch 'to' account (nil if contract creation)
+					to_addr := tx.GetTo()
+					if to_addr != nil && *to_addr != from_addr {
+
+						to_data, _ := rodb.GetOne(kv.PlainState, to_addr.Bytes())
+
+						// if it's a contract, prefetch its code
+						var to_acc accounts.Account
+						to_acc.DecodeForStorage(to_data)
+
+						if !to_acc.IsEmptyCodeHash() {
+							rodb.GetOne(kv.Code, to_acc.CodeHash.Bytes())
+						}
+					}
+				}
+			}
+
+			select {
+				case blockChan <- block:
+				case <-quitChan:
+					break Loop
+			}
+		}
+	}
+
+	log.Info("Prefetch thread exiting", "error", err)
+	close(blockChan)
+	<-quitChan
+	errChan <- err
+	log.Info("Prefetch thread exited")
+}
+
 func SpawnExecuteBlocksStage(s *StageState, u Unwinder, tx kv.RwTx, toBlock uint64, ctx context.Context, cfg ExecuteBlockCfg, initialCycle bool) (err error) {
 	quit := ctx.Done()
 	useExternalTx := tx != nil
@@ -254,21 +313,23 @@ func SpawnExecuteBlocksStage(s *StageState, u Unwinder, tx kv.RwTx, toBlock uint
 	if err != nil {
 		return err
 	}
+
+	blockChan := make(chan *types.Block, 2)
+	errChan   := make(chan error)
+	quitChan  := make(chan int)
+
+	go fetchBlocks(ctx, cfg, blockChan, errChan, quitChan, stageProgress + 1, to)
+
 	var stoppedErr error
 
-	for blockNum := stageProgress + 1; blockNum <= to; blockNum++ {
+	blockNum := stageProgress
+	for block := range blockChan {
+		blockNum += 1
+
 		if stoppedErr = common.Stopped(quit); stoppedErr != nil {
 			break
 		}
 
-		blockHash, err := rawdb.ReadCanonicalHash(tx, blockNum)
-		if err != nil {
-			return err
-		}
-		block, _, err := cfg.blockReader.BlockWithSenders(ctx, tx, blockHash, blockNum)
-		if err != nil {
-			return err
-		}
 		if block == nil {
 			log.Error(fmt.Sprintf("[%s] Empty block", logPrefix), "blocknum", blockNum)
 			break
@@ -297,18 +358,18 @@ func SpawnExecuteBlocksStage(s *StageState, u Unwinder, tx kv.RwTx, toBlock uint
 			log.Info("Committed State", "gas reached", currentStateGas, "gasTarget", gasState)
 			currentStateGas = 0
 			if err = batch.Commit(); err != nil {
-				return err
+				break
 			}
 			if !useExternalTx {
 				if err = s.Update(tx, stageProgress); err != nil {
-					return err
+					break
 				}
 				if err = tx.Commit(); err != nil {
-					return err
+					break
 				}
 				tx, err = cfg.db.BeginRw(context.Background())
 				if err != nil {
-					return err
+					break
 				}
 				// TODO: This creates stacked up deferrals
 				defer tx.Rollback()
@@ -339,6 +400,16 @@ func SpawnExecuteBlocksStage(s *StageState, u Unwinder, tx kv.RwTx, toBlock uint
 			tx.CollectMetrics()
 			syncMetrics[stages.Execution].Set(blockNum)
 		}
+	}
+
+	close(quitChan)
+	e := <-errChan
+	if err == nil {
+		err = e
+	}
+
+	if err != nil {
+		return err
 	}
 
 	if err = s.Update(batch, stageProgress); err != nil {
