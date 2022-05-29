@@ -209,8 +209,8 @@ func fetchBlocks(ctx context.Context, cfg ExecuteBlockCfg, blockChan chan *types
 				for _, tx := range block.Transactions() {
 
 					// prefetch 'from' account
-					// The tx was provided by BlockWithSenders() which saves the sender to the transaction,
-					// meaning we can use .GetSender() directly and we don't need to derive it by .Sender(Signer).
+					// The block was provided by BlockWithSenders() which saves the sender to the transactions,
+					// meaning we can use tx.GetSender() directly and we don't need to derive it by tx.Sender(Signer).
 					from_addr, _ := tx.GetSender()
 					rodb.GetOne(kv.PlainState, from_addr.Bytes())
 
