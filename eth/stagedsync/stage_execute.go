@@ -323,9 +323,9 @@ func SpawnExecuteBlocksStage(s *StageState, u Unwinder, tx kv.RwTx, toBlock uint
 		select {
 		default:
 		case <-logEvery.C:
-			cumulativeGas, err := rawdb.ReadCumulativeGasUsed(tx, blockNum)
-			if err != nil {
-				return err
+			cumulativeGas, e := rawdb.ReadCumulativeGasUsed(tx, blockNum)
+			if e != nil {
+				cumulativeGas = startGasUsed
 			}
 			totalGasTmp := new(big.Int).Set(totalGasUsed)
 			elapsed := time.Since(startTime)
